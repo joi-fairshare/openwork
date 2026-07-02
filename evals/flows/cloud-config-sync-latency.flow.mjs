@@ -12,8 +12,11 @@
  *   4. PATCH the provider on Den to add a second model. Do nothing in the
  *      app. Assert the engine reports the new model within 45s (30s tick +
  *      sweep + engine reload margin).
- *   5. Settings -> Cloud shows the "Synced ... ago" label.
- *   6. Cleanup: delete the provider on Den; palette-sync removes it locally.
+ *   5. Runtime injection: the imported provider lives in the runtime
+ *      config, NOT in the workspace opencode.jsonc — and a pre-seeded
+ *      legacy jsonc block for the same id is migrated (stripped).
+ *   6. Settings -> Cloud shows the "Synced ... ago" label.
+ *   7. Cleanup: delete the provider on Den; null the runtime entry.
  *
  * Required env:
  * - OPENWORK_EVAL_DEN_API_URL  Den API base
@@ -109,6 +112,30 @@ async function pollEngineModels(ctx, predicate, timeoutMs, label) {
   throw new Error(`Timed out after ${timeoutMs}ms waiting for: ${label}`);
 }
 
+// Read/write the workspace project opencode.jsonc via the OpenWork server
+// config-file API, from inside the page (uses the app's own token/port).
+const configFileExpr = (method, contentJson) => `(async () => {
+  const port = localStorage.getItem("openwork.server.port");
+  const token = localStorage.getItem("openwork.server.token");
+  const workspaceId = (window.location.hash.match(/workspace\\/(ws_[a-z0-9]+)/) ?? [])[1];
+  if (!port || !token || !workspaceId) return null;
+  const base = "http://127.0.0.1:" + port;
+  const headers = { Authorization: "Bearer " + token, "Content-Type": "application/json" };
+  if (${JSON.stringify(method)} === "GET") {
+    const file = await (await fetch(base + "/workspace/" + workspaceId + "/opencode-config?scope=project", { headers })).json();
+    return file.content ?? "";
+  }
+  const response = await fetch(base + "/workspace/" + workspaceId + "/opencode-config", {
+    method: "POST", headers,
+    body: JSON.stringify({ scope: "project", content: ${contentJson} }),
+  });
+  return response.status;
+})()`;
+
+async function readProjectConfig(ctx) {
+  return await ctx.eval(configFileExpr("GET", "null"), { awaitPromise: true });
+}
+
 async function runPaletteSync(ctx) {
   await ctx.control("command_palette.open");
   // Placeholders are not innerText; wait for the input element itself.
@@ -161,6 +188,9 @@ export default {
     {
       name: "Create the org LLM provider on Den (cleanup leftovers first)",
       run: async (ctx) => {
+        // Pin the flow to the active workspace before touching its config —
+        // all page-side reads/writes derive the workspace from the hash.
+        await ensureWorkspaceRoute(ctx);
         const existing = await denRequest(ctx, "/v1/llm-providers");
         for (const provider of existing.llmProviders ?? []) {
           if (provider.name === PROVIDER_NAME) {
@@ -181,6 +211,29 @@ export default {
         ctx.providerId = created.llmProvider?.id;
         ctx.assert(typeof ctx.providerId === "string" && ctx.providerId.length > 0, "Provider create returned no id.");
         ctx.log(`Created Den provider ${ctx.providerId}`);
+
+        // Seed a legacy-style jsonc block for this provider id so the flow
+        // proves the migration path: runtime injection must strip it.
+        const raw = await readProjectConfig(ctx);
+        ctx.assert(raw !== null, "Could not reach the project opencode.jsonc API.");
+        if (!raw.includes(ctx.providerId)) {
+          const legacyBlock = JSON.stringify({
+            npm: "@ai-sdk/openai-compatible",
+            name: "Legacy Stale Block",
+            models: { "stale-model": { name: "stale-model" } },
+          });
+          let nextContent;
+          if (/"provider"\s*:\s*\{/.test(raw)) {
+            nextContent = raw.replace(/"provider"\s*:\s*\{/, (match) => `${match}\n    "${ctx.providerId}": ${legacyBlock},`);
+          } else if (raw.trim()) {
+            nextContent = raw.replace(/\}\s*$/, `,\n  "provider": { "${ctx.providerId}": ${legacyBlock} }\n}\n`);
+          } else {
+            nextContent = `{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": { "${ctx.providerId}": ${legacyBlock} }\n}\n`;
+          }
+          const status = await ctx.eval(configFileExpr("POST", JSON.stringify(nextContent)), { awaitPromise: true });
+          ctx.assert(status === 200, `Seeding legacy block failed: ${status}`);
+          ctx.log("Seeded legacy jsonc block for migration proof");
+        }
       },
     },
     {
@@ -199,6 +252,19 @@ export default {
               90_000,
               "engine reports the imported provider with its model",
             );
+            // Runtime injection proof: the provider is served by the engine
+            // while the workspace opencode.jsonc contains no block for it —
+            // including the legacy block we seeded, which must be migrated.
+            const raw = await readProjectConfig(ctx);
+            ctx.assert(
+              typeof raw === "string" && !raw.includes(ctx.providerId),
+              "opencode.jsonc still contains a block for the imported provider (runtime injection failed or migration did not strip the legacy block)",
+            );
+            ctx.recordEvidence({
+              type: "assertion",
+              status: "passed",
+              assertion: "Imported provider is engine-visible with zero opencode.jsonc footprint (runtime config injection; legacy block migrated)",
+            });
           },
           screenshot: {
             name: "palette-sync-imported",
@@ -273,32 +339,44 @@ export default {
       },
     },
     {
-      name: "Cleanup: delete the provider on Den and strip the local block",
+      name: "Cleanup: delete the provider on Den and null the runtime entry",
       run: async (ctx) => {
+        await ensureWorkspaceRoute(ctx);
         await denRequest(ctx, `/v1/llm-providers/${encodeURIComponent(ctx.providerId)}`, { method: "DELETE", allowStatuses: [204, 404] });
-        // Known gap (follow-up): the removal sweep depends on the persisted
-        // import record, and a pre-existing read-modify-write race between
-        // cloudImports writers can lose it — so a Den-side delete is not yet
-        // reliably propagated. Until that lands, strip the imported block
-        // directly through the config-file API to leave the workspace clean.
+        // Removal propagation still depends on the persisted import record
+        // (cloudImports race, tracked separately). Clean deterministically via
+        // the same per-key runtime merge the store now uses: null deletes.
+        const status = await ctx.eval(`(async () => {
+          const port = localStorage.getItem("openwork.server.port");
+          const token = localStorage.getItem("openwork.server.token");
+          const workspaceId = (window.location.hash.match(/workspace\\/(ws_[a-z0-9]+)/) ?? [])[1];
+          if (!port || !token || !workspaceId) return null;
+          const base = "http://127.0.0.1:" + port;
+          const headers = { Authorization: "Bearer " + token, "Content-Type": "application/json" };
+          const response = await fetch(base + "/workspace/" + workspaceId + "/config", {
+            method: "PATCH", headers,
+            body: JSON.stringify({ opencode: { provider: { [${JSON.stringify(ctx.providerId)}]: null } } }),
+          });
+          return response.status;
+        })()`, { awaitPromise: true });
+        ctx.assert(status === 200, `Runtime null-delete failed: ${status}`);
+        // The store's removal path reloads the engine itself; this direct
+        // cleanup needs an explicit reload for the engine to drop the entry.
         await ctx.eval(`(async () => {
           const port = localStorage.getItem("openwork.server.port");
           const token = localStorage.getItem("openwork.server.token");
           const workspaceId = (window.location.hash.match(/workspace\\/(ws_[a-z0-9]+)/) ?? [])[1];
-          if (!port || !token || !workspaceId) return "missing context";
-          const base = "http://127.0.0.1:" + port;
-          const headers = { Authorization: "Bearer " + token, "Content-Type": "application/json" };
-          const file = await (await fetch(base + "/workspace/" + workspaceId + "/opencode-config?scope=project", { headers })).json();
-          const raw = file.content ?? "";
-          const pattern = new RegExp('\\\\n\\\\s*// OpenWork Cloud import: ' + ${JSON.stringify(PROVIDER_NAME)} + '[^\\\\n]*\\\\n\\\\s*"lpr_[a-z0-9]+": \\\\{[\\\\s\\\\S]*?\\\\n    \\\\},?', 'g');
-          const next = raw.replace(pattern, "");
-          if (next === raw) return "no block to strip";
-          const write = await fetch(base + "/workspace/" + workspaceId + "/opencode-config", {
-            method: "POST", headers,
-            body: JSON.stringify({ scope: "project", content: next }),
+          const response = await fetch("http://127.0.0.1:" + port + "/workspace/" + workspaceId + "/engine/reload", {
+            method: "POST", headers: { Authorization: "Bearer " + token },
           });
-          return "stripped: " + write.status;
-        })()`, { awaitPromise: true }).then((result) => ctx.log(`Cleanup: ${result}`)).catch(() => {});
+          return response.status;
+        })()`, { awaitPromise: true }).catch(() => null);
+        await pollEngineModels(
+          ctx,
+          (models) => models === null,
+          90_000,
+          "provider removed from the engine after runtime null-delete",
+        );
       },
     },
   ],
